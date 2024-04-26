@@ -1,9 +1,12 @@
 const express = require('express');
 const cors = require('cors');
 const { MongoClient } = require('mongodb');
-require('dotenv').config();
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+require('dotenv').config();
 
 const app = express();
 app.use(cors());
@@ -26,80 +29,52 @@ async function connectDB() {
 
 connectDB();
 
+// Admin credentials
+const adminCredentials = {
+  username: 'admin',
+  password: 'admin123'
+};
+
+// Admin login endpoint
+app.post('/admin/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    if (username !== adminCredentials.username || password !== adminCredentials.password) {
+      return res.status(401).json({ message: 'Invalid admin credentials' });
+    }
+    const token = jwt.sign({ username: adminCredentials.username }, process.env.JWT_SECRET || 'jwtsecret');
+    res.status(200).json({ message: 'Admin login successful', token });
+  } catch (error) {
+    console.error('Admin login error:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Middleware to verify admin token
+function verifyAdminToken(req, res, next) {
+  const token = req.headers.authorization;
+  if (!token) {
+    return res.status(401).json({ message: 'No token provided' });
+  }
+  jwt.verify(token, process.env.JWT_SECRET || 'jwtsecret', (err, decoded) => {
+    if (err) {
+      return res.status(401).json({ message: 'Invalid token' });
+    }
+    if (decoded.username !== adminCredentials.username) {
+      return res.status(401).json({ message: 'Unauthorized admin access' });
+    }
+    req.admin = decoded;
+    next();
+  });
+}
+
 // User Model
 const userCollection = client.db('studentDB').collection('users');
-const feedbackCollection = client.db('studentDB').collection('feedback');
-
-// Get all feedback endpoint
-app.get('/api/feedbacks', async (req, res) => {
-  try {
-    const feedbacks = await feedbackCollection.find().toArray();
-    res.status(200).json(feedbacks);
-  } catch (error) {
-    console.error('Error fetching feedbacks:', error);
-    res.status(500).json({ message: 'Error fetching feedbacks', error: error.message });
-  }
-});
-
-// Feedback Submission Endpoint
-app.post('/api/feedback', async (req, res) => {
-  try {
-    const feedback = req.body;
-    if (!feedback) {
-      return res.status(400).json({ message: 'Feedback data is missing' });
-    }
-    const result = await feedbackCollection.insertOne(feedback);
-    res.status(201).json({ message: 'Feedback submitted successfully', feedback: result.ops[0] });
-  } catch (error) {
-    console.error('Error submitting feedback:', error);
-    res.status(500).json({ message: 'Error submitting feedback', error: error.message });
-  }
-});
-
-// Address Model and Endpoint
-const addressCollection = client.db('studentDB').collection('addresses');
-
-app.post('/api/address', async (req, res) => {
-  try {
-    const {
-      firstName,
-      lastName,
-      address1,
-      address2,
-      city,
-      state,
-      zip,
-      country,
-      saveAddress,
-    } = req.body;
-
-    const address = {
-      firstName,
-      lastName,
-      address1,
-      address2,
-      city,
-      state,
-      zip,
-      country,
-      saveAddress,
-    };
-
-    await addressCollection.insertOne(address);
-    res.status(200).json({ message: 'Address saved successfully', address });
-  } catch (error) {
-    console.error('Error saving address:', error);
-    res.status(500).json({ message: 'Error saving address', error: error.message });
-  }
-});
 
 // Register a new user
 app.post('/register', async (req, res) => {
   try {
     const { name, email, password, role } = req.body;
-    if (!name || !email || !password || !role) {
-      return res.status(400).json({ message: 'All fields are required' });
-    }
     const existingUser = await userCollection.findOne({ email });
     if (existingUser) {
       return res.status(400).json({ message: 'Email already exists' });
@@ -109,27 +84,35 @@ app.post('/register', async (req, res) => {
     res.status(201).json({ message: 'User registered successfully' });
   } catch (error) {
     console.error('Error registering user', error);
-    res.status(500).json({ message: 'Error registering user', error: error.message });
+    res.status(500).json({ message: 'Error registering user' });
   }
 });
 
-// Login endpoint
+// Route for user login
 app.post('/login', async (req, res) => {
+  const { email, password } = req.body;
+
   try {
-    const { email, password } = req.body;
+    // Check if user exists
     const user = await userCollection.findOne({ email });
     if (!user) {
-      return res.status(401).json({ message: 'Invalid credentials' });
+      return res.status(401).json({ message: 'Invalid email or password' });
     }
+
+    // Validate password
     const isPasswordValid = await bcrypt.compare(password, user.password);
     if (!isPasswordValid) {
-      return res.status(401).json({ message: 'Invalid credentials' });
+      return res.status(401).json({ message: 'Invalid email or password' });
     }
+
+    // Create JWT token
     const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET || 'jwtsecret');
-    res.status(200).json({ message: 'Login successful', token });
+
+    // Send token as response
+    res.json({ token });
   } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({ message: 'Internal server error', error: error.message });
+    console.error('Login failed:', error);
+    res.status(500).json({ message: 'Something went wrong. Please try again later.' });
   }
 });
 
@@ -142,12 +125,84 @@ app.post('/resetpassword', async (req, res) => {
     res.status(200).json({ message: 'Password reset successfully' });
   } catch (error) {
     console.error('Password reset error:', error);
-    res.status(500).json({ message: 'Internal server error', error: error.message });
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Handle POST request to upload room details and images
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, 'uploads/'); // Directory where uploaded files will be saved
+  },
+  filename: (req, file, cb) => {
+    cb(null, `${Date.now()}-${file.originalname}`); // Rename file with timestamp to avoid conflicts
+  },
+});
+const upload = multer({ storage });
+
+app.post('/rooms', upload.array('images', 5), (req, res) => {
+  console.log(req.files); // Log the received files
+  const { name, description, price } = req.body;
+  const images = req.files.map(file => file.filename); // Get filenames of uploaded images
+
+  // Save room details and image filenames to database or any other storage mechanism
+  // Here, we are just sending the filenames as a response
+  res.status(201).json({ 
+    message: 'Room details and images uploaded successfully',
+    images: images.map(filename => `${req.protocol}://${req.get('host')}/${filename}`) // Send URLs of uploaded images in the response
+  });
+});
+
+
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({ message: 'Something went wrong' });
+});
+
+// Route to fetch user data
+app.get('/users', async (req, res) => {
+  try {
+    const users = await client.db('studentDB').collection('users').find().toArray();
+    res.json(users);
+  } catch (error) {
+    console.error('Error fetching user data:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Update user endpoint
+app.put('/users/:email', async (req, res) => {
+  const { email } = req.params;
+  const updatedUserData = req.body;
+
+  try {
+    // Update the user in the database
+    await userCollection.updateOne({ email }, { $set: updatedUserData });
+    res.status(200).json({ message: 'User updated successfully' });
+  } catch (error) {
+    console.error('Error updating user:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Delete user endpoint
+app.delete('/users/:email', async (req, res) => {
+  const { email } = req.params;
+
+  try {
+    // Delete the user from the database
+    await userCollection.deleteOne({ email });
+    res.status(200).json({ message: 'User deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting user:', error);
+    res.status(500).json({ message: 'Internal server error' });
   }
 });
 
 // Start the server
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
-  console.log(Server is running on port ${PORT});
+  console.log(`Server is running on port ${PORT}`);
 });
